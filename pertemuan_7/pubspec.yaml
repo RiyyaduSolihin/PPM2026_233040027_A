@@ -1,0 +1,27 @@
+name: pertemuan_4
+description: "Mini App Catatan Mahasiswa — Persistensi Lokal dengan SQLite (sqflite) & CRUD."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.6.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # === Baru di Pertemuan 4 ===
+  sqflite: ^2.3.3+1   # akses database SQLite di Android/iOS
+  path: ^1.9.0        # helper join path file (untuk lokasi database)
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
