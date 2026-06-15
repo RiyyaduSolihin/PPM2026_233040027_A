@@ -1,11 +1,10 @@
 import 'package:flutter/material.dart';
 
-import 'db_helper.dart';
+import 'api_client.dart'; // <-- BARU: ganti db_helper.dart
 
 void main() {
-  // Wajib: sqflite butuh binding Flutter sudah diinisialisasi sebelum
-  // ada operasi platform channel (saat DB pertama kali dibuka).
-  WidgetsFlutterBinding.ensureInitialized();
+  // WidgetsFlutterBinding.ensureInitialized() tidak diperlukan lagi —
+  // package:http tidak pakai platform channel seperti sqflite.
   runApp(const MyApp());
 }
 
@@ -13,9 +12,9 @@ void main() {
 // MODEL — Catatan
 // =====================================================================
 //
-// Bedanya dengan Pertemuan 3: sekarang `id` jadi field utama (nullable
-// untuk catatan baru yang belum disimpan), dan kita tambah toMap/fromMap
-// sebagai jembatan antara objek Dart ↔ row SQLite.
+// Yang berubah dari P4:
+//   - toMap/fromMap  →  toJson/fromJson
+//   - dibuatPada disimpan sebagai ISO-8601 string, bukan int epoch
 class Catatan {
   final int? id;
   final String judul;
@@ -31,24 +30,23 @@ class Catatan {
     required this.dibuatPada,
   });
 
-  // Objek Dart → Map untuk db.insert / db.update.
-  // Kalau id null, jangan dikirim — biar AUTOINCREMENT yang isi.
-  Map<String, Object?> toMap() => {
+  // Objek Dart → Map JSON untuk dikirim ke server via POST/PUT.
+  // Kalau id null, tidak dikirim (server yang isi saat insert).
+  Map<String, dynamic> toJson() => {
     if (id != null) 'id': id,
     'judul': judul,
     'isi': isi,
     'kategori': kategori,
-    'dibuat_pada': dibuatPada.millisecondsSinceEpoch,
+    'dibuat_pada': dibuatPada.toUtc().toIso8601String(),
   };
 
-  // Row dari db.query → objek Dart.
-  static Catatan fromMap(Map<String, Object?> m) => Catatan(
+  // Map JSON dari response server → objek Dart.
+  static Catatan fromJson(Map<String, dynamic> m) => Catatan(
     id: m['id'] as int?,
     judul: m['judul'] as String,
     isi: m['isi'] as String,
     kategori: m['kategori'] as String,
-    dibuatPada:
-    DateTime.fromMillisecondsSinceEpoch(m['dibuat_pada'] as int),
+    dibuatPada: DateTime.parse(m['dibuat_pada'] as String),
   );
 
   // Helper untuk form Edit — copy dengan beberapa field diganti.
@@ -70,7 +68,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Catatan Mahasiswa (SQLite)',
+      title: 'Catatan Mahasiswa (REST API)', // <-- judul diupdate
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorSchemeSeed: Colors.indigo,
@@ -83,7 +81,6 @@ class MyApp extends StatelessWidget {
       onGenerateRoute: (settings) {
         switch (settings.name) {
           case '/form':
-          // arguments boleh null (mode tambah) atau Catatan (mode edit).
             final arg = settings.arguments;
             return MaterialPageRoute(
               builder: (_) => CatatanFormPage(initial: arg as Catatan?),
@@ -104,9 +101,9 @@ class MyApp extends StatelessWidget {
 // HOME PAGE — StatefulWidget + FutureBuilder
 // =====================================================================
 //
-// Bedanya dengan P3: state internal `List<Catatan>` HILANG. Sebagai
-// gantinya kita pegang `Future<List<Catatan>>` yang nilainya datang dari
-// database. UI dirender oleh `FutureBuilder`.
+// Dari P4: struktur FutureBuilder SAMA PERSIS.
+// Yang berubah: DbHelper.instance → ApiClient.instance
+// Error state sekarang menampilkan pesan dari ApiException.
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -123,24 +120,19 @@ class _HomePageState extends State<HomePage> {
     _muatUlang();
   }
 
-  // Bukan async — tugasnya hanya mengganti Future yang dipegang state.
-  // FutureBuilder akan otomatis menampilkan loading lalu data baru.
   void _muatUlang() {
     setState(() {
-      _futureCatatan = DbHelper.instance.getAll();
+      _futureCatatan = ApiClient.instance.getAll(); // <-- BARU
     });
   }
 
   Future<void> _bukaForm({Catatan? initial}) async {
-    // pushNamed mengembalikan Future yang resolve saat form pop.
     await Navigator.pushNamed(context, '/form', arguments: initial);
-    // Apapun hasilnya (insert, update, batal), muat ulang dari DB.
     _muatUlang();
   }
 
   Future<void> _bukaDetail(Catatan c) async {
     await Navigator.pushNamed(context, '/detail', arguments: c);
-    // Detail bisa memicu edit → refresh untuk jaga-jaga.
     _muatUlang();
   }
 
@@ -165,12 +157,19 @@ class _HomePageState extends State<HomePage> {
     );
 
     if (yakin == true) {
-      await DbHelper.instance.delete(c.id!);
-      if (!mounted) return;
-      _muatUlang();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('"${c.judul}" dihapus')),
-      );
+      try {
+        await ApiClient.instance.delete(c.id!); // <-- BARU
+        if (!mounted) return;
+        _muatUlang();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('"${c.judul}" dihapus')),
+        );
+      } on ApiException catch (e) { // <-- BARU: catch ApiException
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Gagal menghapus: ${e.message}')),
+        );
+      }
     }
   }
 
@@ -196,11 +195,12 @@ class _HomePageState extends State<HomePage> {
           }
 
           // === STATE 2: error ===
+          // Sekarang pesan error bisa berasal dari ApiException
           if (snapshot.hasError) {
-            return _ErrorState(
-              pesan: snapshot.error.toString(),
-              onRetry: _muatUlang,
-            );
+            final e = snapshot.error;
+            final pesan =
+            e is ApiException ? e.message : 'Terjadi kesalahan: $e';
+            return _ErrorState(pesan: pesan, onRetry: _muatUlang);
           }
 
           final data = snapshot.data ?? const [];
@@ -264,12 +264,10 @@ class _EmptyState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.note_alt_outlined,
-              size: 80, color: Colors.grey.shade400),
+          Icon(Icons.note_alt_outlined, size: 80, color: Colors.grey.shade400),
           const SizedBox(height: 12),
           Text('Belum ada catatan',
-              style:
-              TextStyle(color: Colors.grey.shade600, fontSize: 16)),
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 16)),
           const SizedBox(height: 4),
           Text('Tekan tombol + untuk menambahkan',
               style: TextStyle(color: Colors.grey.shade500)),
@@ -316,10 +314,6 @@ class _ErrorState extends StatelessWidget {
 // =====================================================================
 // CATATAN FORM PAGE — Stateful + Form
 // =====================================================================
-//
-// SATU halaman untuk dua mode:
-//   - initial == null  → mode CREATE (insert)
-//   - initial != null  → mode EDIT   (update)
 class CatatanFormPage extends StatefulWidget {
   final Catatan? initial;
   const CatatanFormPage({super.key, this.initial});
@@ -342,7 +336,6 @@ class _CatatanFormPageState extends State<CatatanFormPage> {
   @override
   void initState() {
     super.initState();
-    // Pre-fill controller kalau mode edit.
     _judulCtrl = TextEditingController(text: widget.initial?.judul ?? '');
     _isiCtrl = TextEditingController(text: widget.initial?.isi ?? '');
     _kategori = widget.initial?.kategori ?? 'Kuliah';
@@ -357,7 +350,6 @@ class _CatatanFormPageState extends State<CatatanFormPage> {
 
   Future<void> _simpan() async {
     if (!_formKey.currentState!.validate()) return;
-
     setState(() => _menyimpan = true);
 
     try {
@@ -367,7 +359,7 @@ class _CatatanFormPageState extends State<CatatanFormPage> {
           isi: _isiCtrl.text.trim(),
           kategori: _kategori,
         );
-        await DbHelper.instance.update(updated);
+        await ApiClient.instance.update(updated); // <-- BARU
       } else {
         final baru = Catatan(
           judul: _judulCtrl.text.trim(),
@@ -375,21 +367,22 @@ class _CatatanFormPageState extends State<CatatanFormPage> {
           kategori: _kategori,
           dibuatPada: DateTime.now(),
         );
-        await DbHelper.instance.insert(baru);
+        await ApiClient.instance.insert(baru); // <-- BARU
       }
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(_isEdit ? 'Catatan diperbarui' : 'Catatan ditambahkan'),
+          content:
+          Text(_isEdit ? 'Catatan diperbarui' : 'Catatan ditambahkan'),
         ),
       );
       Navigator.pop(context);
-    } catch (e) {
+    } on ApiException catch (e) { // <-- BARU: catch ApiException
       if (!mounted) return;
       setState(() => _menyimpan = false);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Gagal menyimpan: $e')),
+        SnackBar(content: Text('Gagal menyimpan: ${e.message}')),
       );
     }
   }
@@ -499,8 +492,6 @@ class DetailCatatanPage extends StatelessWidget {
             icon: const Icon(Icons.edit),
             onPressed: () async {
               await Navigator.pushNamed(context, '/form', arguments: catatan);
-              // Setelah edit, tutup detail juga supaya tampilan refresh
-              // dari Home (data lama di sini sudah usang).
               if (context.mounted) Navigator.pop(context);
             },
           ),
